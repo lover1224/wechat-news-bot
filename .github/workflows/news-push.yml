@@ -29,4 +29,4 @@ jobs:
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
           NEWS_API_URL: ${{ secrets.NEWS_API_URL }}
           NEWS_API_KEY: ${{ secrets.NEWS_API_KEY }}
-        run: python docs/news_push_bot.py
+        run: python news_push_bot.py
