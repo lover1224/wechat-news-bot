@@ -3,6 +3,7 @@
 """
 企业微信新闻推送机器人 - 聚合数据版
 功能：从聚合数据获取科技新闻，推送到企业微信群
+每次推送5条新闻，自动去重
 """
 
 import requests
@@ -32,6 +33,9 @@ JUHE_API_URL = "https://v.juhe.cn/toutiao/index"
 
 # 新闻类型：keji(科技)、guonei(国内)、guoji(国际)、yule(娱乐)
 NEWS_TYPE = "keji"
+
+# 每次推送的新闻数量
+NEWS_COUNT = 5
 
 # ============================================
 # 日志函数
@@ -106,6 +110,37 @@ def is_recent_news(news_date, tolerance_days=2):
     # 只允许宽容范围内的新闻（0到tolerance_days天前）
     return 0 <= delta <= tolerance_days
 
+def remove_duplicates(news_list, key='uniquekey'):
+    """
+    去除重复新闻
+    
+    Args:
+        news_list: 新闻列表
+        key: 去重依据的字段（默认uniquekey）
+    
+    Returns:
+        list: 去重后的新闻列表
+    """
+    seen = set()
+    unique_list = []
+    
+    for item in news_list:
+        # 获取去重字段的值
+        unique_value = item.get(key)
+        
+        # 如果没有该字段，使用title作为备选
+        if not unique_value:
+            unique_value = item.get('title', '')
+        
+        # 如果没见过这条新闻，添加到列表
+        if unique_value not in seen:
+            seen.add(unique_value)
+            unique_list.append(item)
+        else:
+            log_warning(f"发现重复新闻，已跳过: {item.get('title', '')[:40]}...")
+    
+    return unique_list
+
 # ============================================
 # 新闻获取函数
 # ============================================
@@ -125,6 +160,8 @@ def get_news_from_api():
         log_info(f"正在调用聚合数据API...")
         log_info(f"新闻类型: {NEWS_TYPE}")
         log_info(f"日期宽容度: {DATE_TOLERANCE_DAYS}天（最近{DATE_TOLERANCE_DAYS+1}天的新闻）")
+        log_info(f"每次推送: {NEWS_COUNT}条新闻")
+        log_info(f"启用去重功能")
 
         # 调用聚合数据接口
         params = {
@@ -169,17 +206,18 @@ def get_news_from_api():
             date_str = item.get("date", "")
             news_date = parse_news_date(date_str)
             
-            # 构建新闻对象
-            news_item = {
-                "title": item.get("title", ""),
-                "description": item.get("digest", item.get("title", "")),
-                "url": item.get("url", ""),
-                "picurl": item.get("thumbnail_pic_s02", item.get("thumbnail_pic_s", "")),
-                "_date": news_date
-            }
-            
             # 判断是否是最近N天的新闻
             if news_date and is_recent_news(news_date, DATE_TOLERANCE_DAYS):
+                # 构建新闻对象
+                news_item = {
+                    "uniquekey": item.get("uniquekey", ""),  # 保留uniquekey用于去重
+                    "title": item.get("title", ""),
+                    "description": item.get("digest", item.get("title", "")),
+                    "url": item.get("url", ""),
+                    "picurl": item.get("thumbnail_pic_s02", item.get("thumbnail_pic_s", "")),
+                    "_date": news_date
+                }
+                
                 recent_news_list.append(news_item)
                 log_info(f"✓ 找到新闻: {item.get('title', '')[:40]}... ({date_str})")
 
@@ -188,11 +226,20 @@ def get_news_from_api():
             log_warning(f"没有找到最近{DATE_TOLERANCE_DAYS+1}天的新闻")
             return []
 
-        # 按时间排序，取最新的3条
-        recent_news_list.sort(key=lambda x: x.get("_date", datetime.min), reverse=True)
-        final_news_list = [item for item in recent_news_list[:3]]
+        # 去重
+        log_info(f"开始去重，当前有 {len(recent_news_list)} 条新闻")
+        unique_news_list = remove_duplicates(recent_news_list, key='uniquekey')
+        log_info(f"去重后剩余 {len(unique_news_list)} 条新闻")
+
+        # 如果去重后数量不足，直接返回所有去重后的新闻
+        if len(unique_news_list) < NEWS_COUNT:
+            log_warning(f"去重后只有 {len(unique_news_list)} 条新闻，不足 {NEWS_COUNT} 条")
         
-        log_info(f"✓ 筛选出 {len(final_news_list)} 条最新新闻")
+        # 按时间排序，取最新的 NEWS_COUNT 条
+        unique_news_list.sort(key=lambda x: x.get("_date", datetime.min), reverse=True)
+        final_news_list = [item for item in unique_news_list[:NEWS_COUNT]]
+        
+        log_info(f"✓ 最终筛选出 {len(final_news_list)} 条最新新闻")
         
         # 打印最终新闻列表
         for i, item in enumerate(final_news_list, 1):
@@ -307,7 +354,7 @@ def main():
     主函数：获取新闻并发送
     """
     log_info("=" * 60)
-    log_info("企业微信新闻推送机器人 - 聚合数据版")
+    log_info("企业微信新闻推送机器人 - 聚合数据版（每次推送5条，自动去重）")
     log_info("=" * 60)
 
     try:
