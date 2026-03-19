@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-企业微信新闻推送机器人 - 独立版本
-支持：GitHub Actions、本地运行
-功能：获取新闻并发送图文消息到企业微信群
+企业微信新闻推送机器人 - 聚合数据版
+功能：从聚合数据获取科技新闻，推送到企业微信群
 """
 
 import requests
-import json
 import os
 import sys
 from datetime import datetime, date
@@ -18,11 +16,22 @@ from datetime import datetime, date
 
 # 从环境变量读取配置
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
-NEWS_API_URL = os.getenv("NEWS_API_URL", "")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY", "")
 
 # 请求超时时间（秒）
 TIMEOUT = 30
+
+# 日期宽容度（天数）
+# 0 = 只推送今天的新闻
+# 1 = 推送今天和昨天的新闻
+# 2 = 推送最近3天的新闻（默认）
+DATE_TOLERANCE_DAYS = int(os.getenv("DATE_TOLERANCE_DAYS", "2"))
+
+# 聚合数据接口URL
+JUHE_API_URL = "https://v.juhe.cn/toutiao/index"
+
+# 新闻类型：keji(科技)、guonei(国内)、guoji(国际)、yule(娱乐)
+NEWS_TYPE = "keji"
 
 # ============================================
 # 日志函数
@@ -44,44 +53,15 @@ def log_warning(message):
     print(f"[{timestamp}] WARNING: {message}", file=sys.stderr, flush=True)
 
 # ============================================
-# 新闻获取函数
+# 工具函数
 # ============================================
-
-def get_mock_news():
-    """
-    获取模拟新闻数据
-
-    Returns:
-        list: 新闻列表
-    """
-    log_warning("使用模拟新闻数据")
-    return [
-        {
-            "title": "字节跳动组织架构调整：今日头条划归抖音",
-            "description": "字节跳动进行内部组织架构大调整，今日头条、西瓜视频等业务划归抖音业务线，合力打造超级应用生态",
-            "url": "https://www.toutiao.com/article/1",
-            "picurl": "https://s3.pstatp.com/toutiao/static/img/logo/logo_201b2bc.png"
-        },
-        {
-            "title": "全球AI技术突破：首例再生胰岛移植成功",
-            "description": "我国医疗技术实现重大突破，成功完成全球首例再生胰岛移植手术，为糖尿病患者带来新希望",
-            "url": "https://www.toutiao.com/article/2",
-            "picurl": "https://sf1-ttcdn-tos.pstatp.com/img/tos-cn-i-qvj2lq49k0/80a000b8c5e8494b9e6e7d9b0c3d4e5f~tplv-tt-for-image:640:356.webp?lk3s=e0680277"
-        },
-        {
-            "title": "华为阿里同日发布AI新品",
-            "description": "科技巨头华为和阿里巴巴同日发布AI新品，标志着国产AI技术进入新阶段",
-            "url": "https://www.toutiao.com/article/3",
-            "picurl": "https://sf1-ttcdn-tos.pstatp.com/img/tos-cn-i-qvj2lq49k0/90b000c8d5e8494c9f6e8e9c1d4e5f6g~tplv-tt-for-image:640:356.webp?lk3s=e0680277"
-        }
-    ]
 
 def parse_news_date(date_str):
     """
     解析新闻日期字符串
 
     Args:
-        date_str: 日期字符串，如 "2026-03-19 15:30:00" 或 "2026-03-19"
+        date_str: 日期字符串，如 "2026-03-19 15:30:00"
 
     Returns:
         datetime: 解析后的日期对象
@@ -92,9 +72,7 @@ def parse_news_date(date_str):
     # 尝试多种日期格式
     formats = [
         "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d",
-        "%Y/%m/%d %H:%M:%S",
-        "%Y/%m/%d"
+        "%Y-%m-%d"
     ]
     
     for fmt in formats:
@@ -105,15 +83,16 @@ def parse_news_date(date_str):
     
     return None
 
-def is_today_news(news_date):
+def is_recent_news(news_date, tolerance_days=2):
     """
-    判断新闻是否是今天的
-
+    判断新闻是否是最近N天的
+    
     Args:
         news_date: 新闻日期对象
-
+        tolerance_days: 宽容天数（默认2天，即最近3天）
+    
     Returns:
-        bool: 如果是今天返回True
+        bool: 如果在宽容范围内返回True
     """
     if not news_date:
         return False
@@ -121,116 +100,112 @@ def is_today_news(news_date):
     today = date.today()
     news_day = news_date.date()
     
-    return news_day == today
+    # 计算日期差
+    delta = (today - news_day).days
+    
+    # 只允许宽容范围内的新闻（0到tolerance_days天前）
+    return 0 <= delta <= tolerance_days
+
+# ============================================
+# 新闻获取函数
+# ============================================
 
 def get_news_from_api():
     """
-    从API获取真实新闻数据
+    从聚合数据API获取新闻
 
     Returns:
-        list: 新闻列表
+        list: 新闻列表（失败返回空列表）
     """
-    if not NEWS_API_URL or not NEWS_API_KEY:
-        log_warning("未配置新闻API，使用模拟数据")
-        return get_mock_news()
+    if not NEWS_API_KEY:
+        log_error("未配置NEWS_API_KEY")
+        return []
 
     try:
-        log_info(f"正在调用新闻API: {NEWS_API_URL}")
+        log_info(f"正在调用聚合数据API...")
+        log_info(f"新闻类型: {NEWS_TYPE}")
+        log_info(f"日期宽容度: {DATE_TOLERANCE_DAYS}天（最近{DATE_TOLERANCE_DAYS+1}天的新闻）")
 
-        # 调用新闻API（支持天行数据、聚合数据等）
+        # 调用聚合数据接口
+        params = {
+            "key": NEWS_API_KEY,
+            "type": NEWS_TYPE
+        }
+
         response = requests.get(
-            NEWS_API_URL,
-            params={
-                "key": NEWS_API_KEY,
-                "num": 20,  # 获取更多新闻，确保能筛选到今天的
-                "page": 1,
-                "rand": 1  # 添加随机参数，避免缓存
-            },
+            JUHE_API_URL,
+            params=params,
             timeout=TIMEOUT
         )
 
         if response.status_code != 200:
-            log_error(f"新闻API调用失败: {response.status_code}")
-            return get_mock_news()
+            log_error(f"API调用失败: HTTP {response.status_code}")
+            return []
 
         data = response.json()
 
-        # 解析返回数据（根据实际API格式调整）
-        news_list = []
+        # 检查聚合数据返回状态
+        if data.get("error_code") != 0:
+            log_error(f"API返回错误: {data.get('error_code')} - {data.get('reason')}")
+            return []
 
-        # 打印API响应用于调试
-        log_info(f"API响应: {str(data)[:500]}")
+        # 解析数据
+        result = data.get("result", {})
+        if result.get("stat") != "1":
+            log_warning(f"API返回状态: {result.get('stat')}")
+            return []
 
-        # 天行数据格式: {code: 200, msg: "success", result: {newslist: [...]}}
-        if data.get("code") == 200 and "result" in data:
-            result = data["result"]
-            # 支持多种字段名：newslist、list
-            news_items = result.get("newslist", result.get("list", []))
+        news_items = result.get("data", [])
+        log_info(f"API返回 {len(news_items)} 条新闻")
 
-            if news_items:
-                today = date.today()
-                log_info(f"今天是: {today}")
-                
-                # 收集所有新闻，优先选择今天的
-                today_news = []
-                recent_news = []
-                
-                for item in news_items:
-                    # 解析新闻日期
-                    date_str = item.get("ctime", item.get("date", item.get("time", "")))
-                    news_date = parse_news_date(date_str)
-                    
-                    news_item = {
-                        "title": item.get("title", ""),
-                        "description": item.get("description", item.get("descri", item.get("title", ""))),
-                        "url": item.get("url", ""),
-                        "picurl": item.get("picUrl", item.get("picurl", ""))
-                    }
-                    
-                    # 判断是否是今天的新闻
-                    if news_date and is_today_news(news_date):
-                        today_news.append({
-                            **news_item,
-                            "_date": news_date
-                        })
-                        log_info(f"找到今天的新闻: {item.get('title', '')[:30]}... ({date_str})")
-                    elif news_date:
-                        recent_news.append({
-                            **news_item,
-                            "_date": news_date
-                        })
-                    else:
-                        # 没有日期信息，也加入最近新闻列表
-                        recent_news.append(news_item)
-                
-                # 优先返回今天的新闻，如果没有，返回最近的新闻
-                if today_news:
-                    log_info(f"找到 {len(today_news)} 条今天的新闻")
-                    # 按时间排序，取最新的3条
-                    today_news.sort(key=lambda x: x["_date"], reverse=True)
-                    news_list = [item for item in today_news[:3]]
-                elif recent_news:
-                    log_warning(f"没有找到今天的新闻，返回最近的 {len(recent_news)} 条新闻")
-                    # 按时间排序，取最新的3条
-                    recent_news.sort(key=lambda x: x.get("_date", datetime.min), reverse=True)
-                    news_list = [item for item in recent_news[:3]]
-                    
-                    # 打印日期信息
-                    for item in news_list[:3]:
-                        date_str = item.get("_date")
-                        if date_str:
-                            log_warning(f"  - {item['title'][:30]}... ({date_str.strftime('%Y-%m-%d')})")
+        # 筛选最近N天的新闻
+        today = date.today()
+        log_info(f"今天是: {today}")
+        
+        recent_news_list = []
+        
+        for item in news_items:
+            # 解析新闻日期
+            date_str = item.get("date", "")
+            news_date = parse_news_date(date_str)
+            
+            # 构建新闻对象
+            news_item = {
+                "title": item.get("title", ""),
+                "description": item.get("digest", item.get("title", "")),
+                "url": item.get("url", ""),
+                "picurl": item.get("thumbnail_pic_s02", item.get("thumbnail_pic_s", "")),
+                "_date": news_date
+            }
+            
+            # 判断是否是最近N天的新闻
+            if news_date and is_recent_news(news_date, DATE_TOLERANCE_DAYS):
+                recent_news_list.append(news_item)
+                log_info(f"✓ 找到新闻: {item.get('title', '')[:40]}... ({date_str})")
 
-        if news_list:
-            log_info(f"成功获取{len(news_list)}条新闻")
-            return news_list
-        else:
-            log_warning("API返回数据为空，使用模拟数据")
-            return get_mock_news()
+        # 如果没有符合条件的新闻
+        if not recent_news_list:
+            log_warning(f"没有找到最近{DATE_TOLERANCE_DAYS+1}天的新闻")
+            return []
+
+        # 按时间排序，取最新的3条
+        recent_news_list.sort(key=lambda x: x.get("_date", datetime.min), reverse=True)
+        final_news_list = [item for item in recent_news_list[:3]]
+        
+        log_info(f"✓ 筛选出 {len(final_news_list)} 条最新新闻")
+        
+        # 打印最终新闻列表
+        for i, item in enumerate(final_news_list, 1):
+            date_str = item.get("_date").strftime("%Y-%m-%d %H:%M") if item.get("_date") else "未知"
+            log_info(f"  {i}. {item['title'][:50]}... ({date_str})")
+        
+        return final_news_list
 
     except Exception as e:
         log_error(f"获取新闻失败: {str(e)}")
-        return get_mock_news()
+        import traceback
+        traceback.print_exc()
+        return []
 
 def get_news():
     """
@@ -246,10 +221,10 @@ def get_news():
     news_list = get_news_from_api()
 
     if not news_list:
-        log_error("获取新闻失败")
+        log_error("❌ 未获取到新闻，任务终止")
         return []
 
-    log_info(f"获取到{len(news_list)}条新闻")
+    log_info(f"✅ 成功获取 {len(news_list)} 条新闻")
     return news_list
 
 # ============================================
@@ -267,14 +242,14 @@ def send_news_message(news_list):
         dict: 发送结果
     """
     if not news_list:
-        log_error("新闻列表为空")
+        log_error("新闻列表为空，取消发送")
         return {"success": False, "message": "新闻列表为空"}
 
     if not WEBHOOK_URL:
         log_error("未配置WEBHOOK_URL环境变量")
         return {"success": False, "message": "未配置WEBHOOK_URL"}
 
-    log_info(f"准备发送{len(news_list)}条图文消息")
+    log_info(f"准备发送 {len(news_list)} 条新闻到企业微信")
 
     # 构建企业微信图文消息格式
     payload = {
@@ -295,9 +270,8 @@ def send_news_message(news_list):
         payload["news"]["articles"].append(article)
 
     try:
-        log_info(f"正在发送到企业微信")
-        log_info(f"Webhook URL: {WEBHOOK_URL[:50]}...")
-
+        log_info(f"正在发送到企业微信...")
+        
         # 发送HTTP POST请求
         response = requests.post(
             WEBHOOK_URL,
@@ -311,7 +285,7 @@ def send_news_message(news_list):
         if response.status_code == 200:
             result = response.json()
             if result.get("errcode", 0) == 0:
-                log_info("✅ 图文消息发送成功")
+                log_info("✅ 消息发送成功")
                 return {"success": True, "message": "发送成功"}
             else:
                 log_error(f"企业微信返回错误: {result}")
@@ -333,7 +307,7 @@ def main():
     主函数：获取新闻并发送
     """
     log_info("=" * 60)
-    log_info("企业微信新闻推送机器人 - 开始运行")
+    log_info("企业微信新闻推送机器人 - 聚合数据版")
     log_info("=" * 60)
 
     try:
@@ -341,11 +315,14 @@ def main():
         log_info("\n步骤1: 获取新闻数据")
         news_list = get_news()
 
+        # 2. 如果没有新闻，直接退出
         if not news_list:
-            log_error("❌ 获取新闻失败，无法继续")
+            log_error("\n" + "=" * 60)
+            log_error("❌ 未获取到新闻，取消推送任务")
+            log_error("=" * 60)
             return 1
 
-        # 2. 发送图文消息
+        # 3. 发送图文消息
         log_info("\n步骤2: 发送图文消息")
         result = send_news_message(news_list)
 
@@ -362,7 +339,8 @@ def main():
 
     except Exception as e:
         log_error(f"\n❌ 任务执行异常: {str(e)}")
-        log_error("=" * 60)
+        import traceback
+        traceback.print_exc()
         return 1
 
 if __name__ == "__main__":
