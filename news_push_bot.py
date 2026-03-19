@@ -10,7 +10,7 @@ import requests
 import json
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, date
 
 # ============================================
 # 配置区域
@@ -76,6 +76,53 @@ def get_mock_news():
         }
     ]
 
+def parse_news_date(date_str):
+    """
+    解析新闻日期字符串
+
+    Args:
+        date_str: 日期字符串，如 "2026-03-19 15:30:00" 或 "2026-03-19"
+
+    Returns:
+        datetime: 解析后的日期对象
+    """
+    if not date_str:
+        return None
+    
+    # 尝试多种日期格式
+    formats = [
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d",
+        "%Y/%m/%d %H:%M:%S",
+        "%Y/%m/%d"
+    ]
+    
+    for fmt in formats:
+        try:
+            return datetime.strptime(date_str.strip(), fmt)
+        except ValueError:
+            continue
+    
+    return None
+
+def is_today_news(news_date):
+    """
+    判断新闻是否是今天的
+
+    Args:
+        news_date: 新闻日期对象
+
+    Returns:
+        bool: 如果是今天返回True
+    """
+    if not news_date:
+        return False
+    
+    today = date.today()
+    news_day = news_date.date()
+    
+    return news_day == today
+
 def get_news_from_api():
     """
     从API获取真实新闻数据
@@ -95,9 +142,9 @@ def get_news_from_api():
             NEWS_API_URL,
             params={
                 "key": NEWS_API_KEY,
-                "num": 3,
+                "num": 20,  # 获取更多新闻，确保能筛选到今天的
                 "page": 1,
-                "word": "互联网"
+                "rand": 1  # 添加随机参数，避免缓存
             },
             timeout=TIMEOUT
         )
@@ -121,13 +168,58 @@ def get_news_from_api():
             news_items = result.get("newslist", result.get("list", []))
 
             if news_items:
-                for item in news_items[:3]:
-                    news_list.append({
+                today = date.today()
+                log_info(f"今天是: {today}")
+                
+                # 收集所有新闻，优先选择今天的
+                today_news = []
+                recent_news = []
+                
+                for item in news_items:
+                    # 解析新闻日期
+                    date_str = item.get("ctime", item.get("date", item.get("time", "")))
+                    news_date = parse_news_date(date_str)
+                    
+                    news_item = {
                         "title": item.get("title", ""),
                         "description": item.get("description", item.get("descri", item.get("title", ""))),
                         "url": item.get("url", ""),
                         "picurl": item.get("picUrl", item.get("picurl", ""))
-                    })
+                    }
+                    
+                    # 判断是否是今天的新闻
+                    if news_date and is_today_news(news_date):
+                        today_news.append({
+                            **news_item,
+                            "_date": news_date
+                        })
+                        log_info(f"找到今天的新闻: {item.get('title', '')[:30]}... ({date_str})")
+                    elif news_date:
+                        recent_news.append({
+                            **news_item,
+                            "_date": news_date
+                        })
+                    else:
+                        # 没有日期信息，也加入最近新闻列表
+                        recent_news.append(news_item)
+                
+                # 优先返回今天的新闻，如果没有，返回最近的新闻
+                if today_news:
+                    log_info(f"找到 {len(today_news)} 条今天的新闻")
+                    # 按时间排序，取最新的3条
+                    today_news.sort(key=lambda x: x["_date"], reverse=True)
+                    news_list = [item for item in today_news[:3]]
+                elif recent_news:
+                    log_warning(f"没有找到今天的新闻，返回最近的 {len(recent_news)} 条新闻")
+                    # 按时间排序，取最新的3条
+                    recent_news.sort(key=lambda x: x.get("_date", datetime.min), reverse=True)
+                    news_list = [item for item in recent_news[:3]]
+                    
+                    # 打印日期信息
+                    for item in news_list[:3]:
+                        date_str = item.get("_date")
+                        if date_str:
+                            log_warning(f"  - {item['title'][:30]}... ({date_str.strftime('%Y-%m-%d')})")
 
         if news_list:
             log_info(f"成功获取{len(news_list)}条新闻")
