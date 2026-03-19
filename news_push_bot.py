@@ -3,13 +3,15 @@
 """
 企业微信新闻推送机器人 - 聚合数据版
 功能：从聚合数据获取科技新闻，推送到企业微信群
-每次推送5条新闻，自动去重
+每次推送5条新闻，自动去重，避免重复推送
 """
 
 import requests
 import os
 import sys
+import json
 from datetime import datetime, date
+from pathlib import Path
 
 # ============================================
 # 配置区域
@@ -23,9 +25,6 @@ NEWS_API_KEY = os.getenv("NEWS_API_KEY", "")
 TIMEOUT = 30
 
 # 日期宽容度（天数）
-# 0 = 只推送今天的新闻
-# 1 = 推送今天和昨天的新闻
-# 2 = 推送最近3天的新闻（默认）
 DATE_TOLERANCE_DAYS = int(os.getenv("DATE_TOLERANCE_DAYS", "2"))
 
 # 聚合数据接口URL
@@ -36,6 +35,12 @@ NEWS_TYPE = "keji"
 
 # 每次推送的新闻数量
 NEWS_COUNT = 5
+
+# 历史记录保留天数
+HISTORY_DAYS = 3
+
+# 历史记录文件
+HISTORY_FILE = Path(__file__).parent / "news_history.json"
 
 # ============================================
 # 日志函数
@@ -63,21 +68,11 @@ def log_warning(message):
 def parse_news_date(date_str):
     """
     解析新闻日期字符串
-
-    Args:
-        date_str: 日期字符串，如 "2026-03-19 15:30:00"
-
-    Returns:
-        datetime: 解析后的日期对象
     """
     if not date_str:
         return None
     
-    # 尝试多种日期格式
-    formats = [
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d"
-    ]
+    formats = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d"]
     
     for fmt in formats:
         try:
@@ -90,54 +85,75 @@ def parse_news_date(date_str):
 def is_recent_news(news_date, tolerance_days=2):
     """
     判断新闻是否是最近N天的
-    
-    Args:
-        news_date: 新闻日期对象
-        tolerance_days: 宽容天数（默认2天，即最近3天）
-    
-    Returns:
-        bool: 如果在宽容范围内返回True
     """
     if not news_date:
         return False
     
     today = date.today()
     news_day = news_date.date()
-    
-    # 计算日期差
     delta = (today - news_day).days
-    
-    # 只允许宽容范围内的新闻（0到tolerance_days天前）
     return 0 <= delta <= tolerance_days
 
-def remove_duplicates(news_list, key='uniquekey'):
+def load_history():
     """
-    去除重复新闻
-    
-    Args:
-        news_list: 新闻列表
-        key: 去重依据的字段（默认uniquekey）
-    
-    Returns:
-        list: 去重后的新闻列表
+    加载历史记录
     """
-    seen = set()
+    if HISTORY_FILE.exists():
+        try:
+            with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
+                history = json.load(f)
+                # 清理过期的历史记录（只保留最近HISTORY_DAYS天的）
+                cutoff_date = datetime.now().timestamp() - (HISTORY_DAYS * 24 * 3600)
+                valid_history = [item for item in history if item.get('timestamp', 0) > cutoff_date]
+                return valid_history
+        except Exception as e:
+            log_warning(f"加载历史记录失败: {e}")
+    return []
+
+def save_history(history):
+    """
+    保存历史记录
+    """
+    try:
+        with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
+            json.dump(history, f, ensure_ascii=False)
+    except Exception as e:
+        log_warning(f"保存历史记录失败: {e}")
+
+def is_in_history(news_item, history):
+    """
+    检查新闻是否在历史记录中
+    """
+    title = news_item.get('title', '').strip().lower()
+    url = news_item.get('url', '').strip()
+    
+    for item in history:
+        if (item.get('title', '').strip().lower() == title or 
+            item.get('url', '') == url):
+            return True, item.get('pushed_at', '')
+    
+    return False, None
+
+def remove_duplicates(news_list):
+    """
+    去除重复新闻（使用标题和URL双重去重）
+    """
+    seen_titles = set()
+    seen_urls = set()
     unique_list = []
     
     for item in news_list:
-        # 获取去重字段的值
-        unique_value = item.get(key)
+        title = item.get('title', '').strip().lower()
+        url = item.get('url', '').strip()
         
-        # 如果没有该字段，使用title作为备选
-        if not unique_value:
-            unique_value = item.get('title', '')
+        # 检查标题和URL是否重复
+        if title in seen_titles or url in seen_urls:
+            log_warning(f"发现重复新闻（标题: {title[:30]}...），已跳过")
+            continue
         
-        # 如果没见过这条新闻，添加到列表
-        if unique_value not in seen:
-            seen.add(unique_value)
-            unique_list.append(item)
-        else:
-            log_warning(f"发现重复新闻，已跳过: {item.get('title', '')[:40]}...")
+        seen_titles.add(title)
+        seen_urls.add(url)
+        unique_list.append(item)
     
     return unique_list
 
@@ -148,9 +164,6 @@ def remove_duplicates(news_list, key='uniquekey'):
 def get_news_from_api():
     """
     从聚合数据API获取新闻
-
-    Returns:
-        list: 新闻列表（失败返回空列表）
     """
     if not NEWS_API_KEY:
         log_error("未配置NEWS_API_KEY")
@@ -159,9 +172,13 @@ def get_news_from_api():
     try:
         log_info(f"正在调用聚合数据API...")
         log_info(f"新闻类型: {NEWS_TYPE}")
-        log_info(f"日期宽容度: {DATE_TOLERANCE_DAYS}天（最近{DATE_TOLERANCE_DAYS+1}天的新闻）")
+        log_info(f"日期宽容度: {DATE_TOLERANCE_DAYS}天")
         log_info(f"每次推送: {NEWS_COUNT}条新闻")
-        log_info(f"启用去重功能")
+        log_info(f"历史记录保留: {HISTORY_DAYS}天")
+
+        # 加载历史记录
+        history = load_history()
+        log_info(f"已加载 {len(history)} 条历史记录")
 
         # 调用聚合数据接口
         params = {
@@ -169,11 +186,7 @@ def get_news_from_api():
             "type": NEWS_TYPE
         }
 
-        response = requests.get(
-            JUHE_API_URL,
-            params=params,
-            timeout=TIMEOUT
-        )
+        response = requests.get(JUHE_API_URL, params=params, timeout=TIMEOUT)
 
         if response.status_code != 200:
             log_error(f"API调用失败: HTTP {response.status_code}")
@@ -207,37 +220,62 @@ def get_news_from_api():
             news_date = parse_news_date(date_str)
             
             # 判断是否是最近N天的新闻
-            if news_date and is_recent_news(news_date, DATE_TOLERANCE_DAYS):
-                # 构建新闻对象
-                news_item = {
-                    "uniquekey": item.get("uniquekey", ""),  # 保留uniquekey用于去重
-                    "title": item.get("title", ""),
-                    "description": item.get("digest", item.get("title", "")),
-                    "url": item.get("url", ""),
-                    "picurl": item.get("thumbnail_pic_s02", item.get("thumbnail_pic_s", "")),
-                    "_date": news_date
-                }
-                
-                recent_news_list.append(news_item)
-                log_info(f"✓ 找到新闻: {item.get('title', '')[:40]}... ({date_str})")
+            if not news_date or not is_recent_news(news_date, DATE_TOLERANCE_DAYS):
+                continue
+            
+            # 构建新闻对象
+            news_item = {
+                "uniquekey": item.get("uniquekey", ""),
+                "title": item.get("title", ""),
+                "description": item.get("digest", item.get("title", "")),
+                "url": item.get("url", ""),
+                "picurl": item.get("thumbnail_pic_s02", item.get("thumbnail_pic_s", "")),
+                "_date": news_date
+            }
+            
+            recent_news_list.append(news_item)
+            log_info(f"✓ 找到新闻: {item.get('title', '')[:40]}... ({date_str})")
 
-        # 如果没有符合条件的新闻
         if not recent_news_list:
             log_warning(f"没有找到最近{DATE_TOLERANCE_DAYS+1}天的新闻")
             return []
 
-        # 去重
+        # 去重（同一次推送内的重复）
         log_info(f"开始去重，当前有 {len(recent_news_list)} 条新闻")
-        unique_news_list = remove_duplicates(recent_news_list, key='uniquekey')
+        unique_news_list = remove_duplicates(recent_news_list)
         log_info(f"去重后剩余 {len(unique_news_list)} 条新闻")
 
-        # 如果去重后数量不足，直接返回所有去重后的新闻
-        if len(unique_news_list) < NEWS_COUNT:
-            log_warning(f"去重后只有 {len(unique_news_list)} 条新闻，不足 {NEWS_COUNT} 条")
+        # 过滤历史记录（避免重复推送）
+        filtered_list = []
+        for item in unique_news_list:
+            in_history, pushed_at = is_in_history(item, history)
+            if in_history:
+                log_warning(f"新闻已推送过（{pushed_at}），跳过: {item.get('title', '')[:40]}...")
+            else:
+                filtered_list.append(item)
+        
+        log_info(f"过滤历史记录后剩余 {len(filtered_list)} 条新闻")
+
+        # 如果过滤后数量不足
+        if len(filtered_list) < NEWS_COUNT:
+            log_warning(f"过滤后只有 {len(filtered_list)} 条新闻，不足 {NEWS_COUNT} 条")
         
         # 按时间排序，取最新的 NEWS_COUNT 条
-        unique_news_list.sort(key=lambda x: x.get("_date", datetime.min), reverse=True)
-        final_news_list = [item for item in unique_news_list[:NEWS_COUNT]]
+        filtered_list.sort(key=lambda x: x.get("_date", datetime.min), reverse=True)
+        final_news_list = [item for item in filtered_list[:NEWS_COUNT]]
+        
+        # 保存到历史记录
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for item in final_news_list:
+            history.append({
+                "title": item.get("title", ""),
+                "url": item.get("url", ""),
+                "pushed_at": current_time,
+                "timestamp": datetime.now().timestamp()
+            })
+        
+        save_history(history)
+        log_info(f"已更新历史记录，当前共 {len(history)} 条")
         
         log_info(f"✓ 最终筛选出 {len(final_news_list)} 条最新新闻")
         
@@ -257,9 +295,6 @@ def get_news_from_api():
 def get_news():
     """
     获取新闻（主函数）
-
-    Returns:
-        list: 新闻列表
     """
     log_info("=" * 60)
     log_info("开始获取新闻数据")
@@ -281,12 +316,6 @@ def get_news():
 def send_news_message(news_list):
     """
     发送图文消息到企业微信群
-
-    Args:
-        news_list (list): 新闻列表
-
-    Returns:
-        dict: 发送结果
     """
     if not news_list:
         log_error("新闻列表为空，取消发送")
@@ -354,7 +383,7 @@ def main():
     主函数：获取新闻并发送
     """
     log_info("=" * 60)
-    log_info("企业微信新闻推送机器人 - 聚合数据版（每次推送5条，自动去重）")
+    log_info("企业微信新闻推送机器人 - 聚合数据版（增强去重）")
     log_info("=" * 60)
 
     try:
@@ -365,7 +394,7 @@ def main():
         # 2. 如果没有新闻，直接退出
         if not news_list:
             log_error("\n" + "=" * 60)
-            log_error("❌ 未获取到新闻，取消推送任务")
+            log_error("❌ 未获取到新闻，任务终止")
             log_error("=" * 60)
             return 1
 
